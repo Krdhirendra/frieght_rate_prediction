@@ -17,16 +17,19 @@ def haversine_np(lon1, lat1, lon2, lat2):
     miles = 3956 * c
     return miles
 
-def preprocess_and_engineer(df, equip_medians=None, global_medians=None):
+def preprocess_and_engineer(df, equip_medians=None, global_medians=None, route_freq_map=None):
     """
     Applies consistent preprocessing and feature engineering to the data.
+    Derived directly from EDA insights:
+      - distance_bin: EDA showed clear rate buckets by haul length category
+      - market_hot: market_index chart showed neutral=1.0; above/below is a key market signal
+      - route_frequency: route volume analysis showed route popularity impacts rate stability
     """
     df = df.copy()
     df['date'] = pd.to_datetime(df['date'])
     
     # 1. Coordinate Imputation (for December chart inputs if they don't exist)
-    # Lexington: 36.99152, -84.99876
-    # Fort Wayne: 41.31561, -85.36206
+    # Lexington: 36.99152, -84.99876 | Fort Wayne: 41.31561, -85.36206
     if 'pickup_lat' not in df.columns:
         df['pickup_lat'] = np.where(df['pickup'] == 'Lexington', 36.99152, np.nan)
         df['pickup_lon'] = np.where(df['pickup'] == 'Lexington', -84.99876, np.nan)
@@ -52,8 +55,27 @@ def preprocess_and_engineer(df, equip_medians=None, global_medians=None):
     df['haversine_distance'] = haversine_np(df['pickup_lon'], df['pickup_lat'], df['delivery_lon'], df['delivery_lat'])
     df['lat_diff'] = np.abs(df['pickup_lat'] - df['delivery_lat'])
     df['lon_diff'] = np.abs(df['pickup_lon'] - df['delivery_lon'])
-    
-    # 4. Impute Missing Weights and Market Indices
+
+    # 4. Distance Bin Feature (from EDA: rate distributions shift clearly across haul length buckets)
+    df['distance_bin'] = pd.cut(
+        df['distance'],
+        bins=[0, 300, 800, 1500, 99999],
+        labels=[0, 1, 2, 3]  # 0=Short, 1=Medium, 2=Long, 3=Very Long
+    ).astype(float)
+
+    # 5. Market Hot Flag (from EDA: market_index neutral at 1.0; above = hot market = higher rates)
+    df['market_hot'] = (df['market_index'] > 1.0).astype(int)
+
+    # 6. Route Frequency (from EDA: high-volume routes have more training data and different rate stability)
+    # Computed from training set only and mapped here to avoid leakage
+    if route_freq_map is not None:
+        df['route_key'] = df['pickup'].astype(str) + '_' + df['delivery'].astype(str)
+        df['route_frequency'] = df['route_key'].map(route_freq_map).fillna(0).astype(float)
+        df.drop(columns=['route_key'], inplace=True)
+    else:
+        df['route_frequency'] = 0.0
+
+    # 7. Impute Missing Weights and Market Indices
     df['weight'] = df['weight'].astype(float)
     if equip_medians is not None:
         for eq_type, med_val in equip_medians.items():
@@ -62,7 +84,7 @@ def preprocess_and_engineer(df, equip_medians=None, global_medians=None):
         df['market_index'] = df['market_index'].fillna(global_medians['market_index'])
         df['quote_signal'] = df['quote_signal'].fillna(global_medians['quote_signal'])
         
-    # 5. Convert Categorical Columns to category Dtype for LightGBM
+    # 8. Convert Categorical Columns to category Dtype for LightGBM
     for col in ['pickup', 'delivery', 'equipment']:
         df[col] = df[col].astype('category')
         
@@ -78,12 +100,21 @@ def main():
     val_df['date'] = pd.to_datetime(val_df['date'])
     dec_df['date'] = pd.to_datetime(dec_df['date'])
     
-    # --- Compute Medians from Training Set (To Avoid Leakage) ---
+    # --- Compute Medians and Route Frequency from Training Set (To Avoid Leakage) ---
     equip_medians = train_df.groupby('equipment')['weight'].median().to_dict()
     global_medians = {
         'market_index': train_df['market_index'].median(),
         'quote_signal': train_df['quote_signal'].median()
     }
+    # Route frequency map: number of training loads per pickup-delivery pair
+    route_freq_map = (
+        train_df.groupby(['pickup', 'delivery'])
+        .size()
+        .reset_index(name='count')
+        .assign(route_key=lambda x: x['pickup'] + '_' + x['delivery'])
+        .set_index('route_key')['count']
+        .to_dict()
+    )
     
     # --- December Feature Preparation ---
     # Merge daily mean market_index and quote_signal from validation.csv to fill December missing features
@@ -92,16 +123,21 @@ def main():
     
     # --- Apply Preprocessing & Feature Engineering ---
     print("Preprocessing and engineering features...")
-    train_feat = preprocess_and_engineer(train_df, equip_medians, global_medians)
-    val_feat = preprocess_and_engineer(val_df, equip_medians, global_medians)
-    dec_feat = preprocess_and_engineer(dec_df, equip_medians, global_medians)
+    train_feat = preprocess_and_engineer(train_df, equip_medians, global_medians, route_freq_map)
+    val_feat = preprocess_and_engineer(val_df, equip_medians, global_medians, route_freq_map)
+    dec_feat = preprocess_and_engineer(dec_df, equip_medians, global_medians, route_freq_map)
     
     # Select Features for the Model
+    # Includes 3 new features derived from EDA:
+    #   distance_bin   - from distance-bin rate analysis
+    #   market_hot     - from market_index time-series analysis (neutral = 1.0)
+    #   route_frequency - from route volume analysis
     features = [
         'pickup', 'delivery', 'pickup_lat', 'pickup_lon', 'delivery_lat', 'delivery_lon',
         'distance', 'equipment', 'weight', 'market_index', 'quote_signal',
         'day_of_week', 'day_of_year', 'days_since_start', 'sin_day_of_year', 'cos_day_of_year',
-        'haversine_distance', 'lat_diff', 'lon_diff'
+        'haversine_distance', 'lat_diff', 'lon_diff',
+        'distance_bin', 'market_hot', 'route_frequency'
     ]
     
     # --- 1. LOCAL TIME-BASED VALIDATION SPLIT ---
