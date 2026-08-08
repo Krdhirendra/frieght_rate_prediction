@@ -20,12 +20,11 @@ FIXED_DISTANCE = 360.0
 FIXED_EQUIPMENT = "Dry Van"
 FIXED_WEIGHT = 32_000.0
 
-
 def fail(message: str) -> None:
     raise SystemExit(f"ERROR: {message}")
 
 
-def read_csv(path: Path, label: str) -> pd.DataFrame:
+def read_csv( path: Path, label: str) -> pd.DataFrame:
     if not path.is_file():
         fail(f"{label} file not found: {path}")
     try:
